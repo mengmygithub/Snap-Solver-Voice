@@ -1,4 +1,28 @@
-<h1 align="center">Snap-Solver <img src="https://img.shields.io/badge/版本-1.5.1-blue" alt="版本"></h1>
+<h1 align="center">Snap-Solver Voice</h1>
+
+## 语音增强版：在另一台电脑部署
+
+本仓库基于 [Zippland/Snap-Solver](https://github.com/Zippland/Snap-Solver)，
+保留原项目与 Apache-2.0 许可证，增加录音、OpenAI Whisper 转写、可编辑校对和手动发送 AI。
+以下原版说明作为参考，**本版本以 [部署说明](docs/voice-deployment.md) 为准**。
+原作者的 Releases 不包含本仓库的语音功能。
+
+安装 Python 3.11 后，克隆本仓库：
+
+```bash
+git clone https://github.com/mengmygithub/Snap-Solver-Voice.git
+cd Snap-Solver-Voice
+python3 run.py
+```
+
+Windows 使用 `py -3.11 run.py`。首次启动自动创建 `.venv` 并安装依赖。
+打开 http://localhost:5001，在设置中填写自己的 OpenAI API Key。
+点击麦克风开始录音，再次点击结束，等待文字显示，校对后点击「发送至AI」。
+录音会上传至 OpenAI 或你配置的中转服务进行转写；转写和 AI 分析分别计费。
+私有仓库需先登录 GitHub；也可下载本仓库 Release 的源码 ZIP，解压后运行同一命令。
+
+默认仅本机访问，不包含任何个人密钥、虚拟环境或录音文件。
+此应用没有登录认证，**不要直接暴露到公网**。
 
 
 <p align="center">

@@ -17,6 +17,10 @@ class SnapSolver {
         
         // Cache DOM elements
         this.captureBtn = document.getElementById('captureBtn');
+        this.recordBtn = document.getElementById('recordBtn');
+        this.asrPanel = document.getElementById('asrPanel');
+        this.asrText = document.getElementById('asrText');
+        this.sendAsrTextBtn = document.getElementById('sendAsrText');
         // 移除裁剪按钮引用
         this.screenshotImg = document.getElementById('screenshotImg');
         this.imagePreview = document.getElementById('imagePreview');
@@ -54,6 +58,10 @@ class SnapSolver {
         // 查找主要UI元素
         this.connectionStatus = document.getElementById('connectionStatus');
         this.captureBtn = document.getElementById('captureBtn');
+        this.recordBtn = document.getElementById('recordBtn');
+        this.asrPanel = document.getElementById('asrPanel');
+        this.asrText = document.getElementById('asrText');
+        this.sendAsrTextBtn = document.getElementById('sendAsrText');
         this.emptyState = document.getElementById('emptyState');
         this.imagePreview = document.getElementById('imagePreview');
         this.screenshotImg = document.getElementById('screenshotImg');
@@ -232,11 +240,13 @@ class SnapSolver {
                 console.log('Connected to server');
                 this.updateConnectionStatus('已连接', true);
                 this.captureBtn.disabled = false;
+                if (this.recordBtn) this.recordBtn.disabled = false;
             });
 
             this.socket.on('disconnect', () => {
                 console.log('Disconnected from server');
                 this.updateConnectionStatus('已断开', false);
+                if (this.recordBtn) this.recordBtn.disabled = true;
             });
 
             this.socket.on('connect_error', (error) => {
@@ -392,6 +402,15 @@ class SnapSolver {
         this.socket.on('ai_response', (data) => {
             console.log('Received ai_response:', data);
             this.updateStatusLight(data.status);
+            if (['completed', 'error', 'stopped'].includes(data.status)) {
+                this.analysisPending = false;
+                if (this.sendAsrTextBtn) {
+                    this.sendAsrTextBtn.disabled = this.isRecording || this.isTranscribing || !this.asrText?.value.trim();
+                }
+            } else if (data.status === 'started') {
+                this.analysisPending = true;
+                if (this.sendAsrTextBtn) this.sendAsrTextBtn.disabled = true;
+            }
             
             // 确保Claude面板可见
             if (this.claudePanel && this.claudePanel.classList.contains('hidden')) {
@@ -401,6 +420,7 @@ class SnapSolver {
             switch (data.status) {
                 case 'started':
                     console.log('Analysis started');
+                    if (this.claudePanel) this.claudePanel.classList.remove('hidden');
                     // 清空显示内容
                     if (this.responseContent) this.responseContent.innerHTML = '';
                     if (this.thinkingContent) this.thinkingContent.innerHTML = '';
@@ -1046,6 +1066,7 @@ class SnapSolver {
         console.log('DEBUG: 设置所有事件监听器（这应该只执行一次）');
         
         this.setupCaptureEvents();
+        this.setupAudioRecordFeature();
         this.setupCropEvents();
         this.setupAnalysisEvents();
         this.setupKeyboardShortcuts();
@@ -1124,6 +1145,331 @@ class SnapSolver {
                 this.captureBtn.innerHTML = '<i class="fas fa-camera"></i>';
             }
         });
+    }
+
+    setupAudioRecordFeature() {
+        if (this.recordBtn) {
+            const newBtn = this.recordBtn.cloneNode(true);
+            this.recordBtn.parentNode.replaceChild(newBtn, this.recordBtn);
+            this.recordBtn = newBtn;
+        } else {
+            return;
+        }
+
+        this.isRecording = false;
+        this.mediaRecorder = null;
+        this.recordedChunks = [];
+        this.recordingStream = null;
+
+        this.recordBtn.addEventListener('click', async () => {
+            if (this.recordBtn.disabled) return;
+
+            if (this.isRecording) {
+                this.stopAudioRecording();
+            } else {
+                if (!this.checkConnectionBeforeAction()) return;
+                await this.startAudioRecording();
+            }
+        });
+
+        this.ensureAsrPanel();
+    }
+
+    async startAudioRecording() {
+        try {
+            if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) {
+                throw new Error('请使用支持录音的浏览器，并通过 localhost 或 HTTPS 访问');
+            }
+
+            this.recordBtn.disabled = true;
+            const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            this.recordingStream = stream;
+
+            let mimeType = '';
+            const candidates = [
+                'audio/webm;codecs=opus',
+                'audio/webm',
+                'audio/mp4'
+            ];
+            for (const t of candidates) {
+                if (window.MediaRecorder && MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(t)) {
+                    mimeType = t;
+                    break;
+                }
+            }
+
+            this.recordedChunks = [];
+            this.mediaRecorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
+            const recorder = this.mediaRecorder;
+            const recordedMimeType = (recorder && recorder.mimeType) ? recorder.mimeType : (mimeType || 'audio/webm');
+
+            recorder.addEventListener('dataavailable', (event) => {
+                if (event.data && event.data.size > 0) {
+                    this.recordedChunks.push(event.data);
+                }
+            });
+
+            recorder.addEventListener('stop', async () => {
+                try {
+                    const blob = new Blob(this.recordedChunks, { type: recordedMimeType || 'audio/webm' });
+                    await this.transcribeAudioBlob(blob);
+                } catch (e) {
+                    this.showAsrStatus('转写失败，可重新录音：' + (e?.message || String(e)));
+                    window.uiManager.showToast('语音转文字失败: ' + (e?.message || String(e)), 'error');
+                } finally {
+                    this.recordedChunks = [];
+                    this.cleanupAudioRecording();
+                    this.resetRecordButton();
+                }
+            });
+
+            this.isRecording = true;
+            this.recordBtn.disabled = false;
+            this.recordBtn.classList.add('recording');
+            this.recordBtn.innerHTML = '<i class="fas fa-stop"></i>';
+
+            recorder.start();
+            this.showAsrStatus('正在录音，再次点击麦克风结束录音。');
+            this.sendAsrTextBtn.disabled = true;
+            window.uiManager.showToast('开始录音，再次点击结束', 'info');
+        } catch (error) {
+            window.uiManager.showToast('无法开始录音: ' + (error?.message || String(error)), 'error');
+            this.cleanupAudioRecording();
+            this.resetRecordButton();
+        }
+    }
+
+    stopAudioRecording() {
+        if (!this.mediaRecorder || this.mediaRecorder.state === 'inactive') {
+            this.cleanupAudioRecording();
+            this.resetRecordButton();
+            return;
+        }
+
+        try {
+            this.isRecording = false;
+            this.recordBtn.classList.remove('recording');
+            this.recordBtn.classList.add('processing');
+            this.recordBtn.disabled = true;
+            this.recordBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i>';
+            this.mediaRecorder.stop();
+            if (this.recordingStream) {
+                this.recordingStream.getTracks().forEach(t => t.stop());
+            }
+        } catch (e) {
+            this.cleanupAudioRecording();
+            this.resetRecordButton();
+            this.showAsrStatus('结束录音失败，请重新录音。');
+        }
+    }
+
+    resetRecordButton() {
+        this.isRecording = false;
+        this.isTranscribing = false;
+        this.recordBtn.classList.remove('recording', 'processing');
+        this.recordBtn.disabled = !this.socket?.connected;
+        this.recordBtn.innerHTML = '<i class="fas fa-microphone"></i>';
+        if (this.sendAsrTextBtn) {
+            this.sendAsrTextBtn.disabled = this.analysisPending || !this.asrText?.value.trim();
+        }
+    }
+
+    cleanupAudioRecording() {
+        try {
+            if (this.recordingStream) {
+                this.recordingStream.getTracks().forEach(t => t.stop());
+            }
+        } catch (e) {
+        } finally {
+            this.recordingStream = null;
+            this.mediaRecorder = null;
+        }
+    }
+
+    ensureAsrPanel() {
+        if (!this.asrPanel) this.asrPanel = document.getElementById('asrPanel');
+        if (!this.asrText) this.asrText = document.getElementById('asrText');
+        if (!this.sendAsrTextBtn) this.sendAsrTextBtn = document.getElementById('sendAsrText');
+
+        if (!this.asrPanel && this.emptyState) {
+            const panel = document.createElement('div');
+            panel.id = 'asrPanel';
+            panel.className = 'asr-panel hidden';
+
+            const header = document.createElement('div');
+            header.className = 'asr-header';
+            header.innerHTML = '<i class="fas fa-microphone"></i><span>语音转文字</span>';
+
+            const textarea = document.createElement('textarea');
+            textarea.id = 'asrText';
+            textarea.className = 'asr-text-area';
+            textarea.rows = 6;
+            textarea.placeholder = '录音结束后，这里会显示转写结果，你可以先校对再发送给AI...';
+
+            const btn = document.createElement('button');
+            btn.id = 'sendAsrText';
+            btn.className = 'btn-action send-text-btn';
+            btn.innerHTML = '<i class="fas fa-paper-plane"></i><span>发送至AI</span>';
+
+            panel.appendChild(header);
+            panel.appendChild(textarea);
+            panel.appendChild(btn);
+
+            this.emptyState.parentNode.insertBefore(panel, this.emptyState);
+
+            this.asrPanel = panel;
+            this.asrText = textarea;
+            this.sendAsrTextBtn = btn;
+        }
+
+        // Keep the transcript independent of the screenshot empty-state visibility.
+        if (this.asrPanel && this.emptyState?.contains(this.asrPanel)) {
+            this.emptyState.parentNode.insertBefore(this.asrPanel, this.emptyState);
+        }
+
+        if (this.sendAsrTextBtn && !this.sendAsrTextBtn.dataset.asrBound) {
+            this.sendAsrTextBtn.dataset.asrBound = '1';
+            this.sendAsrTextBtn.addEventListener('click', () => {
+                if (!this.checkConnectionBeforeAction()) return;
+                if (this.sendAsrTextBtn.disabled) return;
+                const text = (this.asrText && this.asrText.value) ? this.asrText.value.trim() : '';
+                if (!text) {
+                    window.uiManager.showToast('请先录音或输入一些文本', 'error');
+                    return;
+                }
+                this.sendTextToAI(text, () => {
+                    if (this.sendAsrTextBtn) this.sendAsrTextBtn.disabled = false;
+                });
+            });
+        }
+    }
+
+    showAsrStatus(message) {
+        this.ensureAsrPanel();
+        if (!this.asrPanel || !this.asrText || !this.sendAsrTextBtn) {
+            throw new Error('语音面板未加载，请刷新页面');
+        }
+        let status = this.asrPanel.querySelector('[role="status"]');
+        if (!status) {
+            status = document.createElement('p');
+            status.setAttribute('role', 'status');
+            this.asrPanel.insertBefore(status, this.asrText);
+        }
+        status.textContent = message;
+        this.asrPanel.classList.remove('hidden');
+        this.emptyState?.classList.add('hidden');
+        this.asrPanel.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }
+
+    async transcribeAudioBlob(blob) {
+        this.isTranscribing = true;
+        this.showAsrStatus('录音已结束，正在上传并转写，请稍候...');
+        this.sendAsrTextBtn.disabled = true;
+        window.uiManager.showToast('正在转写语音...', 'info');
+        const settings = window.settingsManager.getSettings();
+
+        const ext = (blob.type && blob.type.includes('mp4')) ? 'mp4' : 'webm';
+        const file = new File([blob], `recording.${ext}`, { type: blob.type || 'audio/webm' });
+
+        const formData = new FormData();
+        formData.append('audio', file);
+        formData.append('language', (settings && settings.language) ? settings.language : '');
+        formData.append('proxyEnabled', settings && settings.proxyEnabled ? '1' : '0');
+        if (settings && settings.proxyEnabled) {
+            formData.append('proxyHost', settings.proxyHost || '127.0.0.1');
+            formData.append('proxyPort', String(settings.proxyPort || ''));
+        }
+
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 135000);
+        let data;
+        try {
+            const resp = await fetch('/api/asr', {
+                method: 'POST', body: formData, signal: controller.signal
+            });
+            data = await resp.json();
+            if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+        } catch (error) {
+            if (error.name === 'AbortError') throw new Error('转写超时，请检查网络后重试');
+            throw error;
+        } finally {
+            clearTimeout(timeout);
+        }
+        const transcript = (data && data.text) ? String(data.text) : '';
+        if (!transcript.trim()) {
+            throw new Error('未识别到文本');
+        }
+
+        this.ensureAsrPanel();
+
+        if (this.imagePreview) this.imagePreview.classList.add('hidden');
+        if (this.emptyState) this.emptyState.classList.add('hidden');
+        if (this.asrPanel) {
+            this.asrPanel.classList.remove('hidden');
+            this.asrPanel.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        }
+
+        if (this.asrText) {
+            this.asrText.disabled = false;
+            this.asrText.value = transcript;
+        }
+        if (this.sendAsrTextBtn) {
+            this.sendAsrTextBtn.disabled = false;
+        }
+
+        if (this.extractedText) {
+            this.extractedText.classList.remove('hidden');
+            this.extractedText.disabled = false;
+            this.extractedText.value = transcript;
+        }
+        if (this.sendExtractedTextBtn) {
+            this.sendExtractedTextBtn.classList.remove('hidden');
+            this.sendExtractedTextBtn.disabled = false;
+        }
+
+        this.showAsrStatus('转写完成，可编辑校对，下方按钮确认后才会发送给 AI。');
+        window.uiManager.showToast('转写完成，请确认后点击“发送至AI”', 'success');
+    }
+
+    sendTextToAI(text, onError) {
+        if (this.analysisPending || !this.checkConnectionBeforeAction()) return;
+        const settings = window.settingsManager.getSettings();
+        const apiKeys = {};
+        Object.keys(window.settingsManager.apiKeyInputs).forEach(keyId => {
+            const input = window.settingsManager.apiKeyInputs[keyId];
+            if (input && input.value) {
+                apiKeys[keyId] = input.value;
+            }
+        });
+
+        try {
+            this.analysisPending = true;
+            if (this.sendAsrTextBtn) this.sendAsrTextBtn.disabled = true;
+            if (this.sendExtractedTextBtn) this.sendExtractedTextBtn.disabled = true;
+            if (this.claudePanel) this.claudePanel.classList.remove('hidden');
+            this.setElementContent(this.responseContent, '已发送，正在等待 AI 响应...');
+            this.updateStatusLight('started');
+
+            this.socket.emit('analyze_text', {
+                text: text,
+                settings: {
+                    ...settings,
+                    apiKeys: apiKeys,
+                    model: settings.model || 'claude-3-7-sonnet-20250219',
+                    modelInfo: settings.modelInfo || {},
+                    modelCapabilities: {
+                        supportsMultimodal: settings.modelInfo?.supportsMultimodal || false,
+                        isReasoning: settings.modelInfo?.isReasoning || false
+                    }
+                }
+            });
+        } catch (error) {
+            this.analysisPending = false;
+            if (this.sendAsrTextBtn) this.sendAsrTextBtn.disabled = false;
+            if (this.sendExtractedTextBtn) this.sendExtractedTextBtn.disabled = false;
+            if (typeof onError === 'function') onError(error);
+            window.uiManager.showToast('发送文本进行分析失败', 'error');
+        }
     }
 
     updateClipboardStatus(message, status = 'neutral') {
@@ -1607,40 +1953,9 @@ class SnapSolver {
                 window.uiManager.showToast('请输入一些文本', 'error');
                 return;
             }
-
-            const settings = window.settingsManager.getSettings();
-            const apiKeys = {};
-            Object.keys(window.settingsManager.apiKeyInputs).forEach(keyId => {
-                const input = window.settingsManager.apiKeyInputs[keyId];
-                if (input && input.value) {
-                    apiKeys[keyId] = input.value;
-                }
-            });
-            
-            console.log("Debug - 发送文本分析API密钥:", apiKeys);
-            
-            // 禁用按钮防止重复点击
-            this.sendExtractedTextBtn.disabled = true;
-
-            try {
-                this.socket.emit('analyze_text', {
-                    text: text,
-                    settings: {
-                        ...settings,
-                        apiKeys: apiKeys,
-                        model: settings.model || 'claude-3-7-sonnet-20250219',
-                        modelInfo: settings.modelInfo || {},
-                        modelCapabilities: {
-                            supportsMultimodal: settings.modelInfo?.supportsMultimodal || false,
-                            isReasoning: settings.modelInfo?.isReasoning || false
-                        }
-                    }
-                });
-            } catch (error) {
-                this.setElementContent(this.responseContent, 'Error: Failed to send text for analysis - ' + error.message);
+            this.sendTextToAI(text, () => {
                 this.sendExtractedTextBtn.disabled = false;
-                window.uiManager.showToast('发送文本进行分析失败', 'error');
-            }
+            });
         });
 
         // Send to Claude button
@@ -1977,10 +2292,16 @@ class SnapSolver {
             this.captureBtn.disabled = false;
             this.captureBtn.innerHTML = '<i class="fas fa-camera"></i>';
         }
+        if (this.recordBtn && !this.isRecording && !this.isTranscribing) {
+            this.recordBtn.disabled = false;
+            this.recordBtn.innerHTML = '<i class="fas fa-microphone"></i>';
+        }
         
         // 显示默认的空白状态
         if (this.emptyState && this.imagePreview) {
-            if (!this.originalImage) {
+            if (this.asrPanel && !this.asrPanel.classList.contains('hidden')) {
+                this.emptyState.classList.add('hidden');
+            } else if (!this.originalImage) {
                 this.emptyState.classList.remove('hidden');
                 this.imagePreview.classList.add('hidden');
             } else {
@@ -2014,10 +2335,14 @@ class SnapSolver {
         this.socket.on('disconnect', () => {
             console.log('Disconnected from server');
             this.updateConnectionStatus('已断开', false);
+            this.analysisPending = false;
             
             // 断开连接时禁用界面
             if (this.captureBtn) {
                 this.captureBtn.disabled = true;
+            }
+            if (this.recordBtn && !this.isRecording) {
+                this.recordBtn.disabled = true;
             }
         });
         

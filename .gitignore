@@ -130,6 +130,13 @@ config/api_keys.json
 config/api_base_urls.json
 .venv/
 venv/
+config/*.local.json
+.env.*
+*.webm
+*.wav
+*.mp3
+*.m4a
+*.zip
 
 # uv
 .python-version

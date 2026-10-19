@@ -125,7 +125,9 @@ class ModelFactory:
             A model instance
         """
         if model_name not in cls._models:
-            raise ValueError(f"Unknown model: {model_name}")
+            cls.initialize()
+            if model_name not in cls._models:
+                raise ValueError(f"Unknown model: {model_name}")
             
         model_info = cls._models[model_name]
         model_class = model_info['class']

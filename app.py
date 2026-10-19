@@ -1,4 +1,4 @@
-from flask import Flask, jsonify, render_template, request, send_from_directory
+from flask import Flask, abort, jsonify, render_template, request, send_from_directory
 from flask_socketio import SocketIO
 import pyautogui
 import base64
@@ -9,6 +9,7 @@ import threading
 from PIL import Image
 import pyperclip
 from models import ModelFactory
+from openai import OpenAI, DefaultHttpxClient, APITimeoutError
 import time
 import os
 import json
@@ -18,15 +19,17 @@ from datetime import datetime
 import sys
 
 app = Flask(__name__)
+app.config['MAX_CONTENT_LENGTH'] = 26 * 1024 * 1024
+app.config['TEMPLATES_AUTO_RELOAD'] = True
 socketio = SocketIO(
     app, 
-    cors_allowed_origins="*", 
+    cors_allowed_origins=None,
     ping_timeout=30, 
     ping_interval=5, 
     max_http_buffer_size=50 * 1024 * 1024,
     async_mode='threading',  # 使用threading模式提高兼容性
-    engineio_logger=True,    # 启用引擎日志，便于调试
-    logger=True              # 启用Socket.IO日志
+    engineio_logger=False,
+    logger=False
 )
 
 # 常量定义
@@ -129,7 +132,7 @@ def create_model_instance(model_id, settings, is_reasoning=False):
     # 确定需要哪个API密钥
     api_key_id = None
     # 特殊情况：o3-mini使用OpenAI API密钥
-    if model_id.lower() == "o3-mini":
+    if model_id.lower() in {"o3-mini", "o3", "o4-mini"}:
         api_key_id = "OpenaiApiKey"
     # 其他Anthropic/Claude模型
     elif "claude" in model_id.lower() or "anthropic" in model_id.lower():
@@ -166,7 +169,7 @@ def create_model_instance(model_id, settings, is_reasoning=False):
         # 根据模型类型选择对应的中转API
         if "claude" in model_id.lower() or "anthropic" in model_id.lower():
             base_url = proxy_api_config.get('apis', {}).get('anthropic', '')
-        elif any(keyword in model_id.lower() for keyword in ["gpt", "openai"]):
+        elif any(keyword in model_id.lower() for keyword in ["gpt", "openai"]) or model_id.lower() in {"o3-mini", "o3", "o4-mini"}:
             base_url = proxy_api_config.get('apis', {}).get('openai', '')
         elif "deepseek" in model_id.lower():
             base_url = proxy_api_config.get('apis', {}).get('deepseek', '')
@@ -183,7 +186,7 @@ def create_model_instance(model_id, settings, is_reasoning=False):
             custom_base_url = api_base_urls.get('anthropic')
             if custom_base_url:
                 base_url = custom_base_url
-        elif any(keyword in model_id.lower() for keyword in ["gpt", "openai"]):
+        elif any(keyword in model_id.lower() for keyword in ["gpt", "openai"]) or model_id.lower() in {"o3-mini", "o3", "o4-mini"}:
             custom_base_url = api_base_urls.get('openai')
             if custom_base_url:
                 base_url = custom_base_url
@@ -483,14 +486,11 @@ def handle_analyze_text(data):
         # 获取maxTokens
         max_tokens = int(settings.get('maxTokens', 8192))
         
-        print(f"Debug - 文本分析请求: {text[:50]}...")
-        print(f"Debug - 最大Token: {max_tokens}, 推理配置: {reasoning_config}")
-        
         # 获取模型和API密钥
         model_id = settings.get('model', 'claude-3-7-sonnet-20250219')
         
         if not text:
-            socketio.emit('error', {'message': '文本内容不能为空'})
+            socketio.emit('ai_response', {'status': 'error', 'error': '文本内容不能为空'}, room=request.sid)
             return
 
         # 获取模型信息，判断是否为推理模型
@@ -522,7 +522,7 @@ def handle_analyze_text(data):
                 if stop_event.is_set():
                     print(f"分析文本生成被用户 {sid} 停止")
                     break
-                    
+
                 socketio.emit('ai_response', response, room=sid)
         finally:
             # 清理任务
@@ -532,7 +532,7 @@ def handle_analyze_text(data):
     except Exception as e:
         print(f"Error in analyze_text: {str(e)}")
         traceback.print_exc()
-        socketio.emit('error', {'message': f'分析文本时出错: {str(e)}'})
+        socketio.emit('ai_response', {'status': 'error', 'error': f'分析文本时出错: {str(e)}'}, room=request.sid)
 
 @socketio.on('analyze_image')
 def handle_analyze_image(data):
@@ -546,14 +546,11 @@ def handle_analyze_image(data):
         # 获取maxTokens
         max_tokens = int(settings.get('maxTokens', 8192))
         
-        print(f"Debug - 图像分析请求")
-        print(f"Debug - 最大Token: {max_tokens}, 推理配置: {reasoning_config}")
-        
         # 获取模型和API密钥
         model_id = settings.get('model', 'claude-3-7-sonnet-20250219')
         
         if not image_data:
-            socketio.emit('error', {'message': '图像数据不能为空'})
+            socketio.emit('ai_response', {'status': 'error', 'error': '图像数据不能为空'}, room=request.sid)
             return
 
         # 获取模型信息，判断是否为推理模型
@@ -585,7 +582,7 @@ def handle_analyze_image(data):
                 if stop_event.is_set():
                     print(f"分析图像生成被用户 {sid} 停止")
                     break
-                    
+
                 socketio.emit('ai_response', response, room=sid)
         finally:
             # 清理任务
@@ -595,7 +592,7 @@ def handle_analyze_image(data):
     except Exception as e:
         print(f"Error in analyze_image: {str(e)}")
         traceback.print_exc()
-        socketio.emit('error', {'message': f'分析图像时出错: {str(e)}'})
+        socketio.emit('ai_response', {'status': 'error', 'error': f'分析图像时出错: {str(e)}'}, room=request.sid)
 
 @socketio.on('capture_screenshot')
 def handle_capture_screenshot(data):
@@ -809,14 +806,9 @@ def api_check_update():
 # 添加配置文件路由
 @app.route('/config/<path:filename>')
 def serve_config(filename):
+    if filename not in {'models.json', 'prompts.json', 'version.json'}:
+        abort(404)
     return send_from_directory(CONFIG_DIR, filename)
-
-# 添加用于获取所有模型信息的API
-@app.route('/api/models', methods=['GET'])
-def get_models():
-    """返回可用的模型列表"""
-    models = ModelFactory.get_available_models()
-    return jsonify(models)
 
 # 获取所有API密钥
 @app.route('/api/keys', methods=['GET'])
@@ -945,7 +937,73 @@ def save_api_keys(api_keys):
 def get_api_key(key_name):
     """获取指定的API密钥"""
     api_keys = load_api_keys()
-    return api_keys.get(key_name, "")
+    return api_keys.get(key_name, "") or (
+        os.environ.get("OPENAI_API_KEY", "") if key_name == "OpenaiApiKey" else ""
+    )
+
+def _asr_language_to_openai(language: str):
+    value = (language or "").strip().lower()
+    if not value:
+        return None
+    if value in ("zh", "zh-cn", "zh_cn", "chinese", "中文"):
+        return "zh"
+    if value in ("en", "en-us", "en_us", "english", "英文"):
+        return "en"
+    if len(value) == 2 and value.isalpha():
+        return value
+    return None
+
+@app.route('/api/asr', methods=['POST'])
+def api_asr():
+    if request.content_length and request.content_length > 25 * 1024 * 1024:
+        return jsonify({"error": "录音文件过大，请分段录音（小于 25 MB）"}), 413
+    try:
+        audio = request.files.get('audio')
+        if not audio:
+            return jsonify({"error": "缺少音频文件(audio)"}), 400
+
+        api_key = get_api_key("OpenaiApiKey")
+        if not api_key:
+            return jsonify({"error": "请先在设置中配置 OpenAI API Key"}), 400
+
+        proxy_enabled = request.form.get('proxyEnabled') in ('1', 'true', 'on', 'yes')
+        proxy_host = (request.form.get('proxyHost') or '').strip()
+        proxy_port = (request.form.get('proxyPort') or '').strip()
+
+        audio_bytes = audio.read(25 * 1024 * 1024)
+        if not audio_bytes:
+            return jsonify({"error": "录音为空，请重新录音"}), 400
+        if len(audio_bytes) >= 25 * 1024 * 1024:
+            return jsonify({"error": "录音文件过大，请分段录音"}), 413
+
+        proxy_api_config = load_proxy_api()
+        base_url = None
+        if proxy_api_config.get('enabled', False):
+            base_url = (proxy_api_config.get('apis', {}) or {}).get('openai') or None
+        client_options = {"api_key": api_key, "base_url": base_url,
+                          "timeout": 120.0, "max_retries": 0}
+        if proxy_enabled:
+            if not proxy_host or not proxy_port.isdigit() or not 1 <= int(proxy_port) <= 65535:
+                return jsonify({"error": "代理主机或端口无效"}), 400
+            client_options["http_client"] = DefaultHttpxClient(
+                proxy=f"http://{proxy_host}:{proxy_port}"
+            )
+
+        openai_lang = _asr_language_to_openai(request.form.get('language', ''))
+        kwargs = {
+            "model": "whisper-1",
+            "file": (audio.filename or "recording.webm", audio_bytes, audio.mimetype)
+        }
+        if openai_lang:
+            kwargs["language"] = openai_lang
+        with OpenAI(**client_options) as client:
+            result = client.audio.transcriptions.create(**kwargs)
+            text = getattr(result, "text", None)
+            return jsonify({"text": text or ""})
+    except APITimeoutError:
+        return jsonify({"error": "转写服务超时，请检查网络或缩短录音后重试"}), 504
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route('/api/models')
 def api_models():
@@ -1101,20 +1159,22 @@ def get_clipboard():
         return jsonify({"success": False, "message": f"服务器内部错误: {str(e)}"}), 500
 
 if __name__ == '__main__':
-    # 尝试使用5000端口，如果被占用则使用5001
-    port = 5000
+    # 默认仅本机访问；局域网共享需要显式配置 HOST。
+    host = os.environ.get('HOST', '127.0.0.1')
+    port = int(os.environ.get('PORT', '5001'))
     import socket
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.bind(('0.0.0.0', port))
+        s.bind((host, port))
         s.close()
     except OSError:
-        port = 5001
-        print(f"端口5000被占用，将使用端口{port}")
+        raise SystemExit(f"端口 {port} 已被占用，请停止旧服务或设置 PORT 使用其他端口")
     
     local_ip = get_local_ip()
     print(f"Local IP Address: {local_ip}")
-    print(f"Connect from your mobile device using: {local_ip}:{port}")
+    print(f"Open http://localhost:{port}")
+    if host == '0.0.0.0':
+        print(f"LAN access: http://{local_ip}:{port} (microphone requires HTTPS)")
     
     # 加载模型配置
     model_config = load_model_config()
@@ -1123,4 +1183,4 @@ if __name__ == '__main__':
         print("已加载模型配置信息")
     
     # Run Flask in the main thread without debug mode
-    socketio.run(app, host='0.0.0.0', port=port, allow_unsafe_werkzeug=True)
+    socketio.run(app, host=host, port=port, allow_unsafe_werkzeug=True)
